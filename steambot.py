@@ -1,14 +1,19 @@
+import os
 import time
 import requests
 
-# --- НАСТРОЙКИ ---
-TOKEN = "ВАШ_ТОКЕН_БОТА"
-CHAT_ID = "ВАШ_CHAT_ID"
+# --- НАСТРОЙКИ (БЕРУТСЯ ИЗ СИСТЕМЫ RENDER) ---
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 APP_ID = "1492070"  # Total War: ROME REMASTERED
 CC = "RU"  # Код страны
 
-
+#Сообщение в тг
 def send_telegram(message):
+    if not TOKEN or not CHAT_ID:
+        print("Ошибка: Токен или Chat ID не заданы в настройках Render!")
+        return
+
     url = f"https://telegram.org{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
@@ -18,9 +23,8 @@ def send_telegram(message):
     except Exception as e:
         print(f"Ошибка Telegram: {e}")
 
-
+#проверка на скидку в Стим
 def check_steam_discount():
-    # ИСПРАВЛЕНО: Правильный слэш и формат ссылки API
     url = f"https://steampowered.com{APP_ID}&cc={CC}"
     try:
         response = requests.get(url).json()
@@ -55,7 +59,7 @@ def check_steam_discount():
 
 
 if __name__ == "__main__":
-    print("Бот успешно запущен и проверяет скидки...")
+    print("Бот успешно запущен на Render и проверяет скидки...")
     while True:
         check_steam_discount()
         time.sleep(3600)  # Проверка каждый час
