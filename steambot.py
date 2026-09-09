@@ -1,34 +1,45 @@
 import os
 import time
 import requests
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# --- НАСТРОЙКИ (БЕРУТСЯ ИЗ СИСТЕМЫ RENDER) ---
+# --- НАСТРОЙКИ (БЕРУТСЯ ИЗ НАСТРОЕК RENDER) ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 APP_ID = "1492070"  # Total War: ROME REMASTERED
 CC = "RU"  # Код страны
 
-#Сообщение в тг
+# ОБМАНКА ДЛЯ БЕСПЛАТНОГО ТАРИФА RENDER
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running successfully!")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
+    print(f"Веб-сервер запущен на порту {port}")
+    server.serve_forever()
+
+# --- ОСНОВНАЯ ЛОГИКА БОТА ---
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
         print("Ошибка: Токен или Chat ID не заданы в настройках Render!")
         return
-
     url = f"https://telegram.org{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        response = requests.post(url, json=payload)
-        if response.status_code != 200:
-            print(f"Ошибка отправки в TG: {response.text}")
+        requests.post(url, json=payload)
     except Exception as e:
         print(f"Ошибка Telegram: {e}")
 
-#проверка на скидку в Стим
 def check_steam_discount():
     url = f"https://steampowered.com{APP_ID}&cc={CC}"
     try:
         response = requests.get(url).json()
-
         if response and response[APP_ID]["success"]:
             data = response[APP_ID]["data"]
             name = data["name"]
@@ -52,14 +63,20 @@ def check_steam_discount():
                     print("Скидки пока нет.")
             else:
                 print("Игра сейчас бесплатна или цена не указана.")
-        else:
-            print("Не удалось получить данные от Steam.")
     except Exception as e:
         print(f"Ошибка запроса к Steam: {e}")
 
-
-if __name__ == "__main__":
+def bot_loop():
     print("Бот успешно запущен на Render и проверяет скидки...")
     while True:
         check_steam_discount()
         time.sleep(3600)  # Проверка каждый час
+
+if __name__ == "__main__":
+    # ТЕПЕРЬ ИСПРАВЛЕНО: Бот уходит в фон, а веб-сервер держит главный поток
+    bot_thread = Thread(target=bot_loop)
+    bot_thread.daemon = True
+    bot_thread.start()
+
+    # Веб-сервер запускается мгновенно, Render сразу увидит порт
+    run_web_server()
