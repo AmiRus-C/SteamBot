@@ -34,6 +34,7 @@ _state = {
     "steam_errors": 0,
 }
 
+
 # ============================================================
 # HTTP-СЕРВЕР
 # ============================================================
@@ -45,20 +46,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_HEAD(self):
-    # Отвечаем так же, как на GET, но без тела — это то, что ждёт UptimeRobot
-    uptime = int(time.time() - _state["started_at"])
-    body = (
-        f"Bot is running successfully!\n"
-        f"Uptime: {uptime}s\n"
-        f"Steam checks: {_state['steam_checks']} ok / "
-        f"{_state['steam_errors']} errors\n"
-        f"Last discount sent: -{_state['last_discount']}%\n"
-    ).encode()
-    self.send_response(200)
-    self.send_header("Content-type", "text/plain; charset=utf-8")
-    self.send_header("Content-Length", str(len(body)))
-    self.end_headers()
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+
+        # --- Ручной heartbeat: /ping?key=XXXX ---
+        if path == "/ping":
+            if not HEARTBEAT_KEY:
+                self._send(403, b"Manual ping disabled (HEARTBEAT_KEY not set)")
+                return
+            key = ""
+            if "?" in self.path:
+                for part in self.path.split("?", 1)[1].split("&"):
+                    if part.startswith("key="):
+                        key = part[4:]
+                        break
+            if key != HEARTBEAT_KEY:
+                self._send(403, b"Forbidden")
+                return
+            Thread(target=send_heartbeat, args=("manual",), daemon=True).start()
+            self._send(200, b"Heartbeat triggered")
+            return
 
         # --- Корень и всё остальное: health-check для Render ---
         uptime = int(time.time() - _state["started_at"])
@@ -72,11 +79,22 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body)
 
     def do_HEAD(self):
+        # Отвечаем так же, как на GET, но без тела — это то, что ждёт UptimeRobot
+        uptime = int(time.time() - _state["started_at"])
+        body = (
+            f"Bot is running successfully!\n"
+            f"Uptime: {uptime}s\n"
+            f"Steam checks: {_state['steam_checks']} ok / "
+            f"{_state['steam_errors']} errors\n"
+            f"Last discount sent: -{_state['last_discount']}%\n"
+        ).encode()
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
 
     def log_message(self, *args):
+        # Отключаем дефолтный лог, чтобы не засорять логи Render пингами
         pass
 
 
@@ -180,6 +198,7 @@ def check_steam_discount():
     data = app["data"]
     name = data.get("name", f"App {APP_ID}")
 
+    # Бесплатная игра или регион без цены
     if "price_overview" not in data:
         print("[steam] цены нет (F2P или недоступна в регионе)", flush=True)
         if _state["last_discount"] != 0:
@@ -191,6 +210,7 @@ def check_steam_discount():
     final_price   = p.get("final_formatted", "?")
     initial_price = p.get("initial_formatted", "?")
 
+    # --- Скидка появилась или изменилась ---
     if disc > 0 and disc != _state["last_discount"]:
         msg = (
             f"🔥 Скидка на {name}!\n"
@@ -202,6 +222,7 @@ def check_steam_discount():
             _state["last_discount"] = disc
             print(f"[steam] уведомление отправлено: -{disc}%", flush=True)
 
+    # --- Скидка закончилась ---
     elif disc == 0 and _state["last_discount"] != 0:
         _state["last_discount"] = 0
         send_telegram(f"ℹ️ Скидка на {name} закончилась.", silent=True)
@@ -216,6 +237,7 @@ def check_steam_discount():
 # ============================================================
 def bot_loop():
     print("[bot] цикл проверки Steam запущен", flush=True)
+    # небольшая задержка на старте, чтобы сервис успел поднять порт
     time.sleep(10)
 
     while True:
@@ -228,10 +250,12 @@ def bot_loop():
 
 def heartbeat_loop():
     print("[hb] цикл heartbeat запущен", flush=True)
+    # Первый heartbeat — при старте (через минуту после запуска)
     time.sleep(60)
     send_heartbeat(reason="startup")
 
     while True:
+        # Случайный интервал 4–6 часов
         delay = random.randint(HEARTBEAT_MIN_INTERVAL, HEARTBEAT_MAX_INTERVAL)
         print(f"[hb] следующий heartbeat через {delay // 60} мин", flush=True)
         time.sleep(delay)
@@ -247,4 +271,5 @@ if __name__ == "__main__":
     Thread(target=bot_loop,       daemon=True).start()
     Thread(target=heartbeat_loop, daemon=True).start()
 
+    # Веб-сервер — в главном потоке (Render сразу видит порт)
     run_web_server()
