@@ -1,50 +1,81 @@
 import os
 import time
 import random
-import requests
-from threading import Thread
+import threading
+from threading import Thread, Lock
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
+from datetime import datetime, timezone
+import requests
 
 # ============================================================
 # НАСТРОЙКИ (берутся из Environment Variables на Render)
 # ============================================================
 TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-APP_ID  = "1492070"          # Total War: ROME REMASTERED
-CC      = "RU"               # Регион цен
+APP_ID  = os.environ.get("STEAM_APP_ID", "1492070")  # Total War: ROME REMASTERED
+CC      = os.environ.get("STEAM_CC", "RU")            # Регион цен
 
 # Интервалы (в секундах)
 STEAM_CHECK_INTERVAL   = 3600          # проверка скидки — раз в час
 HEARTBEAT_MIN_INTERVAL = 4 * 3600      # минимум 4 часа между heartbeat
 HEARTBEAT_MAX_INTERVAL = 6 * 3600      # максимум 6 часов
+TELEGRAM_POLL_INTERVAL  = 3            # опрос Long Polling для Telegram
 
-# Секретный путь для ручной проверки:
-#   GET https://<твой-сервис>.onrender.com/ping?key=<HEARTBEAT_KEY>
+# Секретный путь для ручной проверки по HTTP
 HEARTBEAT_KEY = os.environ.get("HEARTBEAT_KEY", "")
 
 # ============================================================
-# СОСТОЯНИЕ (в памяти процесса)
+# СОСТОЯНИЕ И СИНХРОНИЗАЦИЯ (Thread-Safe State)
 # ============================================================
+_state_lock = Lock()
 _state = {
     "last_discount": 0,
     "last_heartbeat": 0.0,
     "started_at": time.time(),
     "steam_checks": 0,
     "steam_errors": 0,
+    "last_error": None,
+    "last_successful_check": 0.0,
+    "last_telemetry_check": 0.0,
 }
 
+def update_state(**kwargs):
+    """Потокобезопасное обновление состояния."""
+    with _state_lock:
+        for key, value in kwargs.items():
+            if key in _state:
+                _state[key] = value
+
+def get_state_snapshot() -> dict:
+    """Потокобезопасное чтение копии состояния."""
+    with _state_lock:
+        return _state.copy()
+
 
 # ============================================================
-# HTTP-СЕРВЕР
+# HTTP-СЕРВЕР (Health Checks для Render / UptimeRobot)
 # ============================================================
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, code, body: bytes, content_type="text/plain; charset=utf-8"):
+    def _build_status_text(self) -> bytes:
+        state = get_state_snapshot()
+        uptime = int(time.time() - state["started_at"])
+        last_err = state["last_error"] or "Нет"
+        text = (
+            f"Bot is running successfully!\n"
+            f"Uptime: {uptime}s\n"
+            f"Steam checks: {state['steam_checks']} ok / {state['steam_errors']} errors\n"
+            f"Last discount sent: -{state['last_discount']}%\n"
+            f"Last error: {last_err}\n"
+        )
+        return text.encode("utf-8")
+
+    def _send(self, code: int, body: bytes, content_type: str = "text/plain; charset=utf-8"):
         self.send_response(code)
         self.send_header("Content-type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if body:
+            self.wfile.write(body)
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -67,34 +98,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"Heartbeat triggered")
             return
 
-        # --- Корень и всё остальное: health-check для Render ---
-        uptime = int(time.time() - _state["started_at"])
-        body = (
-            f"Bot is running successfully!\n"
-            f"Uptime: {uptime}s\n"
-            f"Steam checks: {_state['steam_checks']} ok / "
-            f"{_state['steam_errors']} errors\n"
-            f"Last discount sent: -{_state['last_discount']}%\n"
-        ).encode()
-        self._send(200, body)
+        # --- Корень и остальные пути: health-check ---
+        self._send(200, self._build_status_text())
 
     def do_HEAD(self):
-        # Отвечаем так же, как на GET, но без тела — это то, что ждёт UptimeRobot
-        uptime = int(time.time() - _state["started_at"])
-        body = (
-            f"Bot is running successfully!\n"
-            f"Uptime: {uptime}s\n"
-            f"Steam checks: {_state['steam_checks']} ok / "
-            f"{_state['steam_errors']} errors\n"
-            f"Last discount sent: -{_state['last_discount']}%\n"
-        ).encode()
+        # Отвечаем корректными заголовками без передачи тела ответа
+        body = self._build_status_text()
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
 
-    def log_message(self, *args):
-        # Отключаем дефолтный лог, чтобы не засорять логи Render пингами
+    def log_message(self, format, *args):
+        # Подавление стандартных логов подключения в консоль Render
         pass
 
 
@@ -106,7 +122,7 @@ def run_web_server():
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM API & COMMANDS
 # ============================================================
 def send_telegram(message: str, silent: bool = False) -> bool:
     if not TOKEN or not CHAT_ID:
@@ -117,6 +133,7 @@ def send_telegram(message: str, silent: bool = False) -> bool:
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
         "disable_notification": silent,
     }
@@ -131,9 +148,6 @@ def send_telegram(message: str, silent: bool = False) -> bool:
         return False
 
 
-# ============================================================
-# HEARTBEAT
-# ============================================================
 def _format_uptime(seconds: int) -> str:
     d, seconds = divmod(seconds, 86400)
     h, seconds = divmod(seconds, 3600)
@@ -146,10 +160,89 @@ def _format_uptime(seconds: int) -> str:
     return " ".join(parts)
 
 
-def send_heartbeat(reason: str = "scheduled"):
+def generate_status_report() -> str:
+    """Генерирует форматированный отчёт о текущем состоянии для Telegram."""
+    state = get_state_snapshot()
     now = time.time()
-    uptime = _format_uptime(int(now - _state["started_at"]))
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    uptime_str = _format_uptime(int(now - state["started_at"]))
+    
+    # Диагностика работоспособности
+    time_since_check = now - state["last_successful_check"] if state["last_successful_check"] > 0 else None
+    
+    # Если просрочено более 2 с половиной циклов (2.5 часа) — считаем, что сервис застрял
+    is_stale = time_since_check is not None and time_since_check > (STEAM_CHECK_INTERVAL * 2.5)
+    
+    if is_stale:
+        status_header = "🔴 <b>Не работает: задержка выполнения проверок</b>"
+    elif state["steam_errors"] > 0 and state["steam_checks"] == 0:
+        status_header = "🔴 <b>Не работает: критическая ошибка подключения</b>"
+    elif state["last_error"] and (state["steam_errors"] / max(1, (state["steam_checks"] + state["steam_errors"]))) > 0.5:
+        status_header = "⚠️ <b>Работает нестабильно (высокий % ошибок)</b>"
+    else:
+        status_header = "🟢 <b>Работает штатно</b>"
+
+    last_check_str = datetime.fromtimestamp(state["last_successful_check"], tz=timezone.utc).strftime("%H:%M:%S UTC") if state["last_successful_check"] > 0 else "Еще не было"
+    err_desc = f"\n❌ <b>Последняя ошибка:</b> <code>{state['last_error']}</code>" if state["last_error"] else ""
+    discount_str = f"-{state['last_discount']}%" if state["last_discount"] > 0 else "нет скидки"
+
+    report = (
+        f"Статус системы:\n"
+        f"{status_header}\n\n"
+        f"⏱ <b>Uptime:</b> {uptime_str}\n"
+        f"🔎 <b>Успешных проверок:</b> {state['steam_checks']}\n"
+        f"⚠️ <b>Ошибок подключения:</b> {state['steam_errors']}\n"
+        f"🕒 <b>Последняя проверка:</b> {last_check_str}\n"
+        f"🏷 <b>Активная скидка:</b> {discount_str}"
+        f"{err_desc}"
+    )
+    return report
+
+
+def telegram_polling_loop():
+    """Обработка команд /status в Telegram в автономном цикле."""
+    if not TOKEN:
+        print("[tg_poll] TOKEN не задан. Команды отключены.", flush=True)
+        return
+
+    offset = 0
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+    print("[tg_poll] Цикл Telegram Long Polling запущен", flush=True)
+
+    while True:
+        try:
+            params = {"offset": offset, "timeout": 20}
+            response = requests.get(url, params=params, timeout=25)
+            if response.status_code == 200:
+                data = response.json()
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    message = update.get("message", {})
+                    text = message.get("text", "").strip()
+                    chat = message.get("chat", {})
+                    incoming_chat_id = str(chat.get("id"))
+
+                    # Отвечаем только на указанный CHAT_ID во избежание постороннего доступа
+                    if CHAT_ID and incoming_chat_id != str(CHAT_ID):
+                        continue
+
+                    if text in ["/status", "/status@YourBot"]:
+                        report = generate_status_report()
+                        send_telegram(report)
+                    elif text in ["/start", "/help"]:
+                        send_telegram("👋 Бот на связи. Используйте /status для проверки состояния.")
+        except Exception as e:
+            # Скрываем временные сбои таймаута сети, логгируем остальные
+            time.sleep(5)
+        time.sleep(TELEGRAM_POLL_INTERVAL)
+
+
+# ============================================================
+# HEARTBEAT
+# ============================================================
+def send_heartbeat(reason: str = "scheduled"):
+    state = get_state_snapshot()
+    uptime = _format_uptime(int(time.time() - state["started_at"]))
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     if reason == "manual":
         title = "🔔 Ручная проверка"
@@ -158,86 +251,92 @@ def send_heartbeat(reason: str = "scheduled"):
     else:
         title = "✅ Бот всё ещё работает"
 
+    disc_text = f"-{state['last_discount']}%" if state['last_discount'] else "нет"
     msg = (
-        f"{title}\n"
+        f"<b>{title}</b>\n"
         f"🕒 {ts}\n"
         f"⏱ Аптайм: {uptime}\n"
-        f"🔎 Проверок Steam: {_state['steam_checks']} "
-        f"(ошибок: {_state['steam_errors']})\n"
-        f"💸 Текущая отслеживаемая скидка: "
-        f"{('-' + str(_state['last_discount']) + '%') if _state['last_discount'] else 'нет'}"
+        f"🔎 Проверок Steam: {state['steam_checks']} (ошибок: {state['steam_errors']})\n"
+        f"💸 Скидка: {disc_text}"
     )
     if send_telegram(msg, silent=(reason != "manual")):
-        _state["last_heartbeat"] = now
+        update_state(last_heartbeat=time.time())
         print(f"[hb] heartbeat отправлен ({reason})", flush=True)
 
 
 # ============================================================
-# STEAM
+# STEAM MONITORING
 # ============================================================
 def check_steam_discount():
-    url = (
-        f"https://store.steampowered.com/api/appdetails"
-        f"?appids={APP_ID}&cc={CC}&l=russian"
-    )
+    url = f"https://store.steampowered.com/api/appdetails?appids={APP_ID}&cc={CC}&l=russian"
+    state = get_state_snapshot()
+
     try:
         r = requests.get(url, timeout=15)
         r.raise_for_status()
         payload = r.json()
-        _state["steam_checks"] += 1
+        
+        # Обновляем счётчик успешных вызовов
+        update_state(
+            steam_checks=state["steam_checks"] + 1,
+            last_successful_check=time.time(),
+            last_error=None
+        )
     except Exception as e:
-        _state["steam_errors"] += 1
-        print(f"[steam] exception: {e}", flush=True)
+        err_msg = str(e)
+        update_state(
+            steam_errors=state["steam_errors"] + 1,
+            last_error=err_msg
+        )
+        print(f"[steam] exception: {err_msg}", flush=True)
         return
 
-    app = payload.get(APP_ID)
+    app = payload.get(str(APP_ID))
     if not app or not app.get("success"):
-        print("[steam] success=false", flush=True)
+        print("[steam] API вернуло success=false", flush=True)
+        update_state(last_error="Steam API success=false")
         return
 
-    data = app["data"]
+    data = app.get("data", {})
     name = data.get("name", f"App {APP_ID}")
 
-    # Бесплатная игра или регион без цены
     if "price_overview" not in data:
-        print("[steam] цены нет (F2P или недоступна в регионе)", flush=True)
-        if _state["last_discount"] != 0:
-            _state["last_discount"] = 0
+        print("[steam] Цена не найдена (F2P или не доступно в регионе)", flush=True)
+        if state["last_discount"] != 0:
+            update_state(last_discount=0)
         return
 
     p = data["price_overview"]
-    disc = p["discount_percent"]
+    disc = p.get("discount_percent", 0)
     final_price   = p.get("final_formatted", "?")
     initial_price = p.get("initial_formatted", "?")
 
-    # --- Скидка появилась или изменилась ---
-    if disc > 0 and disc != _state["last_discount"]:
+    # --- Новая или изменившаяся скидка ---
+    if disc > 0 and disc != state["last_discount"]:
         msg = (
-            f"🔥 Скидка на {name}!\n"
-            f"📉 Размер: -{disc}%\n"
-            f"💰 {final_price} (было {initial_price})\n"
-            f"🔗 https://store.steampowered.com/app/{APP_ID}"
+            f"🔥 <b>Скидка на {name}!</b>\n"
+            f"📉 <b>Размер:</b> -{disc}%\n"
+            f"💰 <b>Цена:</b> {final_price} (было {initial_price})\n"
+            f"🔗 <a href='https://store.steampowered.com/app/{APP_ID}'>Открыть в Steam</a>"
         )
         if send_telegram(msg):
-            _state["last_discount"] = disc
-            print(f"[steam] уведомление отправлено: -{disc}%", flush=True)
+            update_state(last_discount=disc)
+            print(f"[steam] Уведомление отправлено: -{disc}%", flush=True)
 
     # --- Скидка закончилась ---
-    elif disc == 0 and _state["last_discount"] != 0:
-        _state["last_discount"] = 0
-        send_telegram(f"ℹ️ Скидка на {name} закончилась.", silent=True)
-        print("[steam] скидка закончилась", flush=True)
-
+    elif disc == 0 and state["last_discount"] != 0:
+        update_state(last_discount=0)
+        send_telegram(f"ℹ️ Скидка на <b>{name}</b> закончилась.", silent=True)
+        print("[steam] Скидка закончилась", flush=True)
     else:
-        print(f"[steam] без изменений (discount={disc}%)", flush=True)
+        print(f"[steam] Без изменений (discount={disc}%)", flush=True)
 
 
 # ============================================================
 # ФОНОВЫЕ ЦИКЛЫ
 # ============================================================
 def bot_loop():
-    print("[bot] цикл проверки Steam запущен", flush=True)
-    # небольшая задержка на старте, чтобы сервис успел поднять порт
+    print("[bot] Цикл проверки Steam запущен", flush=True)
     time.sleep(10)
 
     while True:
@@ -245,19 +344,18 @@ def bot_loop():
             check_steam_discount()
         except Exception as e:
             print(f"[bot] unexpected error: {e}", flush=True)
+            update_state(last_error=str(e))
         time.sleep(STEAM_CHECK_INTERVAL)
 
 
 def heartbeat_loop():
-    print("[hb] цикл heartbeat запущен", flush=True)
-    # Первый heartbeat — при старте (через минуту после запуска)
+    print("[hb] Цикл heartbeat запущен", flush=True)
     time.sleep(60)
     send_heartbeat(reason="startup")
 
     while True:
-        # Случайный интервал 4–6 часов
         delay = random.randint(HEARTBEAT_MIN_INTERVAL, HEARTBEAT_MAX_INTERVAL)
-        print(f"[hb] следующий heartbeat через {delay // 60} мин", flush=True)
+        print(f"[hb] Следующий heartbeat через {delay // 60} мин", flush=True)
         time.sleep(delay)
         send_heartbeat(reason="scheduled")
 
@@ -266,10 +364,12 @@ def heartbeat_loop():
 # ТОЧКА ВХОДА
 # ============================================================
 if __name__ == "__main__":
-    print("[main] запуск...", flush=True)
+    print("[main] Запуск сервиса...", flush=True)
 
-    Thread(target=bot_loop,       daemon=True).start()
+    # Запуск фоновых потоков
+    Thread(target=bot_loop, daemon=True).start()
     Thread(target=heartbeat_loop, daemon=True).start()
+    Thread(target=telegram_polling_loop, daemon=True).start()
 
-    # Веб-сервер — в главном потоке (Render сразу видит порт)
+    # Веб-сервер блокирует главный поток для поддержания работы процесса Render
     run_web_server()
