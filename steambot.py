@@ -45,26 +45,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
-        path = self.path.split("?", 1)[0]
-
-        # --- Ручной heartbeat: /ping?key=XXXX ---
-        if path == "/ping":
-            if not HEARTBEAT_KEY:
-                self._send(403, b"Manual ping disabled (HEARTBEAT_KEY not set)")
-                return
-            key = ""
-            if "?" in self.path:
-                for part in self.path.split("?", 1)[1].split("&"):
-                    if part.startswith("key="):
-                        key = part[4:]
-                        break
-            if key != HEARTBEAT_KEY:
-                self._send(403, b"Forbidden")
-                return
-            Thread(target=send_heartbeat, args=("manual",), daemon=True).start()
-            self._send(200, b"Heartbeat triggered")
-            return
+    def do_HEAD(self):
+    # Отвечаем так же, как на GET, но без тела — это то, что ждёт UptimeRobot
+    uptime = int(time.time() - _state["started_at"])
+    body = (
+        f"Bot is running successfully!\n"
+        f"Uptime: {uptime}s\n"
+        f"Steam checks: {_state['steam_checks']} ok / "
+        f"{_state['steam_errors']} errors\n"
+        f"Last discount sent: -{_state['last_discount']}%\n"
+    ).encode()
+    self.send_response(200)
+    self.send_header("Content-type", "text/plain; charset=utf-8")
+    self.send_header("Content-Length", str(len(body)))
+    self.end_headers()
 
         # --- Корень и всё остальное: health-check для Render ---
         uptime = int(time.time() - _state["started_at"])
