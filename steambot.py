@@ -12,7 +12,7 @@ import requests
 # ============================================================
 TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-APP_ID  = os.environ.get("STEAM_APP_ID", "1492070")  # Total War: ROME REMASTERED
+APP_ID  = os.environ.get("STEAM_APP_ID", "885970")  # Total War: ROME REMASTERED
 CC      = os.environ.get("STEAM_CC", "RU")            # Регион цен
 
 # Интервалы (в секундах)
