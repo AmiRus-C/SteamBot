@@ -13,7 +13,7 @@ import requests
 TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 APP_ID  = os.environ.get("STEAM_APP_ID", "885970")  # Total War: ROME REMASTERED
-CC      = os.environ.get("STEAM_CC", "RU")            # Регион цен
+CC      = os.environ.get("STEAM_CC", "")            # Регион цен
 
 # Интервалы (в секундах)
 STEAM_CHECK_INTERVAL   = 3600          # проверка скидки — раз в час
